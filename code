@@ -1,0 +1,90 @@
+# /api/woo/sync – run on demand or cron
+import os, time, hashlib, requests, psycopg2
+from psycopg2.extras import RealDictCursor
+
+WOO_BASE = os.getenv("WOO_BASE")     # https://checkout.yourdomain.com/wp-json/wc/v3
+CK = os.getenv("WOO_CK")
+CS = os.getenv("WOO_CS")
+AUTH = (CK, CS)
+BATCH = 100
+
+def db():
+  return psycopg2.connect(os.getenv("PG_DSN"))
+
+def _h(row):
+  s = f"{row['mpn']}|{row.get('name','')}|{row.get('price') or ''}|{row.get('stock_qty') or 0}"
+  return hashlib.sha1(s.encode()).hexdigest()
+
+def fetch_local_parts(limit=100000):
+  sql = """SELECT mpn, COALESCE(name, mpn) AS name,
+                  ROUND(price::numeric, 2)::text AS price,
+                  COALESCE(stock_qty,0)::int AS stock_qty
+           FROM parts WHERE price IS NOT NULL"""
+  with db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+    cur.execute(sql); return cur.fetchall()
+
+def load_map():
+  with db() as conn, conn.cursor() as cur:
+    cur.execute("SELECT mpn, woo_product_id, last_hash FROM woo_products")
+    return {r[0]: {"id": r[1], "hash": r[2] or ""} for r in cur.fetchall()}
+
+def upsert_map(mpn, pid, h):
+  with db() as conn, conn.cursor() as cur:
+    cur.execute("""INSERT INTO woo_products (mpn, woo_product_id, last_hash, last_synced_at)
+                   VALUES (%s,%s,%s, now())
+                   ON CONFLICT (mpn) DO UPDATE
+                   SET woo_product_id=EXCLUDED.woo_product_id,
+                       last_hash=EXCLUDED.last_hash,
+                       last_synced_at=now()""", (mpn, pid, h))
+    conn.commit()
+
+def sku_id_map():
+  m, page = {}, 1
+  while True:
+    r = requests.get(f"{WOO_BASE}/products", params={"per_page":100, "page":page, "status":"any"}, auth=AUTH)
+    r.raise_for_status(); rows = r.json()
+    if not rows: break
+    for it in rows:
+      if it.get("sku"): m[it["sku"]] = it["id"]
+    page += 1
+  return m
+
+def sync():
+  local = fetch_local_parts()
+  map_db = load_map()
+  map_woo = sku_id_map()
+
+  create, update = [], []
+  for row in local:
+    h = _h(row)
+    known = map_db.get(row["mpn"], {})
+    if h == known.get("hash"): continue
+
+    payload = {
+      "name": row["name"],
+      "sku": row["mpn"],
+      "regular_price": str(row["price"]),
+      "manage_stock": True,
+      "stock_quantity": int(row["stock_qty"]),
+      "stock_status": "instock" if row["stock_qty"] > 0 else "outofstock",
+    }
+    pid = known.get("id") or map_woo.get(row["mpn"])
+    if pid: payload["id"] = pid; update.append(payload)
+    else:   create.append(payload)
+
+  # push batches
+  for bucket, key in ((create, "create"), (update, "update")):
+    for i in range(0, len(bucket), BATCH):
+      body = { key: bucket[i:i+BATCH] }
+      r = requests.post(f"{WOO_BASE}/products/batch", auth=AUTH, json=body)
+      if r.status_code == 429: time.sleep(2); r = requests.post(f"{WOO_BASE}/products/batch", auth=AUTH, json=body)
+      r.raise_for_status()
+      for p in r.json().get(key, []):
+        upsert_map(p["sku"], p["id"], _h({
+          "mpn": p["sku"],
+          "name": p["name"],
+          "price": p.get("regular_price"),
+          "stock_qty": p.get("stock_quantity") or 0
+        }))
+
+  return {"created": len(create), "updated": len(update)}
