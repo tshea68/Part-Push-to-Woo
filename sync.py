@@ -1,7 +1,7 @@
 import os, sys, math, time, hashlib
 import requests
-+ import psycopg
-+ from psycopg.rows import dict_row
+import psycopg
+from psycopg.rows import dict_row
 
 WOO_BASE = os.environ["WOO_BASE"].rstrip("/")  # e.g. https://appgeeks.../wp-json/wc/v3
 AUTH = (os.environ["WOO_CK"], os.environ["WOO_CS"])
