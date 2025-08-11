@@ -1,7 +1,7 @@
 import os, sys, math, time, hashlib
 import requests
-import psycopg2
-from psycopg2.extras import RealDictCursor
++ import psycopg
++ from psycopg.rows import dict_row
 
 WOO_BASE = os.environ["WOO_BASE"].rstrip("/")  # e.g. https://appgeeks.../wp-json/wc/v3
 AUTH = (os.environ["WOO_CK"], os.environ["WOO_CS"])
@@ -30,7 +30,7 @@ def fetch_parts(limit=None):
     else:
         params = None
 
-    with psycopg2.connect(PG_DSN) as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+    with psycopg.connect(PG_DSN) as conn, conn.cursor(row_factory=dict_row) as cur:
         cur.execute(sql, params)
         return cur.fetchall()
 
