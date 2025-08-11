@@ -1,16 +1,32 @@
-import os, sys, math, time, hashlib
+import os, sys, time, hashlib
 import requests
 import psycopg
 from psycopg.rows import dict_row
 
-WOO_BASE = os.environ["WOO_BASE"].rstrip("/")  # e.g. https://appgeeks.../wp-json/wc/v3
+# Optional: load .env locally (ignored on Render if no file)
+try:
+    from dotenv import load_dotenv  # python-dotenv
+    load_dotenv()
+except Exception:
+    pass
+
+# --- Env ---
+WOO_BASE = os.environ["WOO_BASE"].rstrip("/")   # e.g. https://your-woo/wp-json/wc/v3
 AUTH = (os.environ["WOO_CK"], os.environ["WOO_CS"])
 PG_DSN = os.environ["PG_DSN"]
 
 BATCH = 100
 
+def map_stock_status(val: str) -> str:
+    v = (val or "").strip().lower()
+    if v in {"instock", "in stock", "available", "yes", "true", "1"}:
+        return "instock"
+    if v in {"onbackorder", "backorder", "preorder"}:
+        return "onbackorder"
+    return "outofstock"
+
 def sha(row):
-    s = f"{row['mpn']}|{row.get('name','')}|{row.get('price') or ''}|{row.get('stock_qty') or 0}"
+    s = f"{row['mpn']}|{row.get('name','')}|{row.get('price') or ''}|{row.get('stock_status') or ''}|{row.get('condition') or ''}"
     return hashlib.sha1(s.encode()).hexdigest()
 
 def fetch_parts(limit=None):
@@ -19,59 +35,62 @@ def fetch_parts(limit=None):
           mpn,
           COALESCE(name, mpn) AS name,
           ROUND(price::numeric, 2)::text AS price,
-          COALESCE(stock_qty,0)::int AS stock_qty
-        FROM parts
+          stock_status,
+          condition
+        FROM public.parts
         WHERE price IS NOT NULL
         ORDER BY mpn
     """
+    params = None
     if limit and int(limit) > 0:
         sql += " LIMIT %s"
         params = (int(limit),)
-    else:
-        params = None
-
     with psycopg.connect(PG_DSN) as conn, conn.cursor(row_factory=dict_row) as cur:
         cur.execute(sql, params)
         return cur.fetchall()
 
 def sku_id_map():
-    """Pull existing Woo products to map SKU -> product ID (paged)."""
     m, page = {}, 1
     while True:
-        r = requests.get(f"{WOO_BASE}/products", params={"per_page":100, "page":page, "status":"any"}, auth=AUTH, timeout=60)
+        r = requests.get(
+            f"{WOO_BASE}/products",
+            params={"per_page": 100, "page": page, "status": "any"},
+            auth=AUTH, timeout=60
+        )
         if r.status_code == 429:
             time.sleep(2); continue
         r.raise_for_status()
         rows = r.json()
-        if not rows: break
+        if not rows:
+            break
         for it in rows:
             sku = it.get("sku")
-            if sku: m[sku] = it["id"]
+            if sku:
+                m[sku] = it["id"]
         page += 1
     return m
 
 def to_payload(row):
+    condition = (row.get("condition") or "New").strip()
     return {
         "name": row["name"],
         "sku": row["mpn"],
         "regular_price": str(row["price"]),
-        "manage_stock": True,
-        "stock_quantity": int(row["stock_qty"]),
-        "stock_status": "instock" if int(row["stock_qty"]) > 0 else "outofstock",
-        # optional fields you can add later:
-        # "tax_status": "taxable",
-        # "categories": [{"id": 123}],
+        "manage_stock": False,  # status-only (no quantities)
+        "stock_status": map_stock_status(row.get("stock_status")),
+        "attributes": [
+            {"name": "Condition", "visible": True, "options": [condition]}
+        ],
     }
 
 def push_batch(body):
-    """POST to Woo batch endpoint with simple retry on 429."""
     url = f"{WOO_BASE}/products/batch"
     for attempt in range(3):
         r = requests.post(url, auth=AUTH, json=body, timeout=120)
         if r.status_code == 429:
             time.sleep(2); continue
-        if r.ok: return r.json()
-        # fail fast for non-retryable
+        if r.ok:
+            return r.json()
         try:
             msg = r.json()
         except Exception:
@@ -99,23 +118,19 @@ def run(limit=None, dry_run=False):
     print(f"[plan] create={len(create)} update={len(update)} (batch size {BATCH})")
 
     if dry_run:
-        print("[dry-run] not calling Woo. Sample create payload:", create[:2])
-        print("[dry-run] sample update payload:", update[:2])
+        print("[dry-run] sample create:", create[:2])
+        print("[dry-run] sample update:", update[:2])
         return {"created": len(create), "updated": len(update), "dry_run": True}
 
-    # Push creates
     created_total = 0
     for i in range(0, len(create), BATCH):
-        chunk = {"create": create[i:i+BATCH]}
-        resp = push_batch(chunk)
+        resp = push_batch({"create": create[i:i+BATCH]})
         created_total += len(resp.get("create", []))
         print(f"[create] {created_total}/{len(create)}")
 
-    # Push updates
     updated_total = 0
     for i in range(0, len(update), BATCH):
-        chunk = {"update": update[i:i+BATCH]}
-        resp = push_batch(chunk)
+        resp = push_batch({"update": update[i:i+BATCH]})
         updated_total += len(resp.get("update", []))
         print(f"[update] {updated_total}/{len(update)}")
 
